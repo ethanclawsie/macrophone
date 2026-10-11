@@ -1,0 +1,1644 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e906466..5ce686d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -254,7 +254,17 @@ void ggml_metal_free(ggml_metal_t ctx) {
+ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     // wait for any backend operations to finish
+     if (ctx->cmd_buf_last) {
+-        [ctx->cmd_buf_last waitUntilCompleted];
++        // [macrophone] spin on the status instead of sleeping in waitUntilCompleted: a decoder step syncs once per
++        // token, and after an idle period the woken thread lands on a cold, slow core (passes ran ~50% slower).
++        // Falls back to blocking after 0.5 s.
++        id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_last;
++        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        while ([cmd_buf status] < MTLCommandBufferStatusCompleted) {
++            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 > 500ull*1000*1000) {
++                [cmd_buf waitUntilCompleted];
++                break;
++            }
++        }
+         ctx->cmd_buf_last = nil;
+     }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 8ac6e08..985dc07 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -97,6 +97,51 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_l
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_flat(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_cpy_flat_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q4_0_epi(ggml_metal_library_t lib, int n_add, bool gelu) {
++    char base[256];
++    char name[256];
++
++    const int nsg = N_SG_Q4_0;
++
++    snprintf(base, 256, "kernel_mul_mv_q4_0_f32_epi");
++    snprintf(name, 256, "%s_nsg=%d_n=%d_gelu=%d", base, nsg, n_add, gelu ? 1 : 0);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int16(cv, nsg,                FC_MUL_MV + 0);
++        ggml_metal_cv_set_int16(cv, (int16_t) n_add,    FC_MUL_MV + 6);
++        ggml_metal_cv_set_bool (cv, gelu,               FC_MUL_MV + 7);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    res.nr0  = N_R0_Q4_0;
++    res.nr1  = 1;
++    res.nsg  = nsg;
++    res.smem = 0;
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d(ggml_metal_library_t lib, const ggml_tensor * op, ggml_op_pool op_pool) {
+     GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 && op->src[0]->type == op->type);
+@@ -921,7 +966,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma(ggml_
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, int epi) {
+     char base[256];
+     char name[256];
+ 
+@@ -946,8 +991,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+ 
+     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
++    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_epi=%d",
++             base, bc_inp, bc_out, ne12, ne13, r2, r3, epi);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+@@ -959,6 +1004,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
++        if (epi > 0) {
++            ggml_metal_cv_set_int16(cv, (int16_t) epi, FC_MUL_MM + 7);
++        }
+ 
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4012b9d..1ea5e4e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -109,6 +109,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_flat          (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q4_0_epi   (ggml_metal_library_t lib, int n_add, bool gelu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
+@@ -137,7 +139,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nt, int rt, bool add);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op, int epi);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 827d926..1f84709 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -938,6 +938,11 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+     atomic_bool d_stop;
+     atomic_int  d_loop;
+ 
++    // [macrophone] the heartbeat thread sleeps on this once keep_alive_s has passed, instead of waking every
++    // time_per_loop_ms forever (a menu bar app should use no CPU while idle)
++    dispatch_semaphore_t d_wake;
++    atomic_bool          d_idle;
++
+     dispatch_group_t d_group;
+ };
+ 
+@@ -992,6 +997,9 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
+     atomic_store_explicit(&res->d_stop, false, memory_order_relaxed);
+     atomic_store_explicit(&res->d_loop, res->loops_per_s*res->keep_alive_s, memory_order_relaxed);
+ 
++    res->d_wake = dispatch_semaphore_create(0);
++    atomic_store(&res->d_idle, false);
++
+     res->d_group = dispatch_group_create();
+ 
+     // start a background thread that periodically requests residency for all the currently active sets in the collection
+@@ -1011,9 +1019,17 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
+                       atomic_fetch_sub_explicit(&res->d_loop, 1, memory_order_relaxed);
+ 
+                       [res->lock unlock];
+-                  }
+ 
+-                  usleep(res->time_per_loop_ms * 1000);
++                      usleep(res->time_per_loop_ms * 1000);
++                  } else {
++                      // [macrophone] nothing to keep alive: block until the next graph compute. Mark idle first and
++                      // re-check, so a keep-alive that lands in between is never missed.
++                      atomic_store(&res->d_idle, true);
++                      if (atomic_load(&res->d_loop) <= 0 && !atomic_load(&res->d_stop)) {
++                          dispatch_semaphore_wait(res->d_wake, DISPATCH_TIME_FOREVER);
++                      }
++                      atomic_store(&res->d_idle, false);
++                  }
+               }
+         }
+ #endif
+@@ -1040,9 +1056,11 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
+     GGML_ASSERT([rsets->data count] == 0);
+ 
+     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
++    dispatch_semaphore_signal(rsets->d_wake);
+ 
+     dispatch_group_wait(rsets->d_group, DISPATCH_TIME_FOREVER);
+     dispatch_release(rsets->d_group);
++    dispatch_release(rsets->d_wake);
+ 
+     [rsets->data release];
+     [rsets->lock release];
+@@ -1355,6 +1373,10 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+                 GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
+                 GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
+                 GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");
++                {
++                    extern bool g_ggml_metal_macrophone_mm_epi;
++                    g_ggml_metal_macrophone_mm_epi = dev->props.has_tensor && getenv("MACROPHONE_MM_EPI_DISABLE") == NULL;
++                }
+                 GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
+                 GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
+ 
+@@ -1441,6 +1463,11 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
+     }
+ 
+     atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
++
++    // [macrophone] wake the heartbeat thread if it went to sleep
++    if (atomic_exchange(&dev->rsets->d_idle, false)) {
++        dispatch_semaphore_signal(dev->rsets->d_wake);
++    }
+ }
+ 
+ struct ggml_metal_event {
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index d78ca7c..debe246 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -706,6 +706,128 @@ static bool ggml_metal_fusion_check_mul_mat_add(
+         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
+ }
+ 
++// [macrophone] single-row q4_0 mat-vec + up to two same-length F32 addends (bias, residual) or one addend + GELU,
++// applied by kernel_mul_mv_q4_0_f32_epi as it writes each output element. A decoder step is a chain of tiny
++// dependent kernels whose launch latency dominates; this removes ~10 of them per Whisper decoder layer.
++static const ggml_tensor * ggml_metal_epi_addend(const ggml_tensor * prev, const ggml_tensor * add) {
++    if (add->op != GGML_OP_ADD || (add->src[0] == prev) == (add->src[1] == prev)) {
++        return NULL;
++    }
++    const ggml_tensor * other = add->src[0] == prev ? add->src[1] : add->src[0];
++    const bool ok = other->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_is_contiguous(other) &&
++        ggml_nelements(other) == prev->ne[0] && ggml_are_same_shape(add, prev);
++    return ok ? other : NULL;
++}
++
++// set by the device init: the tensor-API kernel_mul_mm implements the epilogue, the simdgroup one does not
++extern "C" bool g_ggml_metal_macrophone_mm_epi;
++bool g_ggml_metal_macrophone_mm_epi = false;
++
++static bool ggml_metal_fusion_check_mul_mat_epi_mm(const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes,
++                                                  ggml_metal_fusion_mode mode) {
++    const ggml_tensor * mm = nodes[0];
++    const bool ok = g_ggml_metal_macrophone_mm_epi &&
++        // below a few hundred columns the extra per-element epilogue work costs more than the passes it saves
++        mm->type == GGML_TYPE_F32 && mm->src[1]->ne[1] >= 384 && mm->src[0]->ne[0] >= 64 &&
++        mm->src[1]->ne[2] == 1 && mm->src[1]->ne[3] == 1 && mm->src[0]->ne[2] == 1 && mm->src[0]->ne[3] == 1 &&
++        !ggml_is_transposed(mm->src[0]) && !ggml_is_transposed(mm->src[1]) && ggml_is_contiguous(mm);
++    if (!ok) {
++        return false;
++    }
++
++    // first ADD: a bias row broadcast over the columns
++    const ggml_tensor * a = nodes[1];
++    if (a->op != GGML_OP_ADD || (a->src[0] == mm) == (a->src[1] == mm) || a->type != GGML_TYPE_F32 || !ggml_are_same_shape(a, mm)) {
++        return false;
++    }
++    const ggml_tensor * bias = a->src[0] == mm ? a->src[1] : a->src[0];
++    if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || ggml_nelements(bias) != mm->ne[0]) {
++        return false;
++    }
++
++    const int n = (int) fusion->ops.size();
++    const ggml_tensor * res = NULL;
++    if (n == 3) {
++        const ggml_tensor * last = nodes[2];
++        if (last->op == GGML_OP_ADD) {
++            if ((last->src[0] == a) == (last->src[1] == a)) {
++                return false;
++            }
++            res = last->src[0] == a ? last->src[1] : last->src[0];
++            if (res->type != GGML_TYPE_F32 || !ggml_are_same_shape(res, mm) || !ggml_is_contiguous(res) || last->type != GGML_TYPE_F32) {
++                return false;
++            }
++        } else if (last->op != GGML_OP_UNARY || ggml_get_unary_op(last) != GGML_UNARY_OP_GELU ||
++                   last->src[0] != a || last->type != GGML_TYPE_F32 || !ggml_is_contiguous(last)) {
++            return false;
++        }
++    }
++
++    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
++        return true;
++    }
++
++    const ggml_tensor * dst = nodes[n - 1];
++    return !ggml_metal_fusion_overlap(dst, mm->src[0]) && !ggml_metal_fusion_overlap(dst, mm->src[1]) &&
++        !ggml_metal_fusion_overlap(dst, bias) && (res == NULL || res->data == dst->data || !ggml_metal_fusion_overlap(dst, res));
++}
++
++static bool ggml_metal_fusion_check_mul_mat_epi(
++        const ggml_metal_fusion       * fusion,
++        const ggml_tensor * const     * nodes,
++        const ggml_cgraph             * gf,
++        const int                     * node_idxs,
++              int                       idx,
++              ggml_metal_fusion_mode    mode) {
++    GGML_UNUSED(gf);
++    GGML_UNUSED(node_idxs);
++    GGML_UNUSED(idx);
++
++    if (nodes[0]->src[1]->ne[1] > 8) {
++        return ggml_metal_fusion_check_mul_mat_epi_mm(fusion, nodes, mode);
++    }
++
++    const ggml_tensor * mm = nodes[0];
++    const bool mv = mm->src[0]->type == GGML_TYPE_Q4_0 && mm->src[1]->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
++        mm->src[1]->ne[1] == 1 && mm->src[1]->ne[2] == 1 && mm->src[1]->ne[3] == 1 &&
++        mm->src[0]->ne[2] == 1 && mm->src[0]->ne[3] == 1 &&
++        ggml_is_contiguous(mm->src[1]) && ggml_is_contiguous(mm) && !ggml_is_transposed(mm->src[0]);
++    if (!mv) {
++        return false;
++    }
++
++    const ggml_tensor * a0 = ggml_metal_epi_addend(mm, nodes[1]);
++    if (a0 == NULL) {
++        return false;
++    }
++
++    const int n = (int) fusion->ops.size();
++    const ggml_tensor * a1 = NULL;
++    if (n == 3) {
++        const ggml_tensor * last = nodes[2];
++        if (last->op == GGML_OP_ADD) {
++            a1 = ggml_metal_epi_addend(nodes[1], last);
++            if (a1 == NULL) {
++                return false;
++            }
++        } else if (last->op != GGML_OP_UNARY || ggml_get_unary_op(last) != GGML_UNARY_OP_GELU ||
++                   last->src[0] != nodes[1] || last->type != GGML_TYPE_F32 || !ggml_is_contiguous(last)) {
++            return false;
++        }
++    }
++
++    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
++        return true;
++    }
++
++    // other threads keep reading the weights and the input vector while outputs are written; the addends are
++    // read by the thread that writes the same element, so an in-place addend is fine
++    const ggml_tensor * dst = nodes[n - 1];
++    return !ggml_metal_fusion_overlap(dst, mm->src[0]) && !ggml_metal_fusion_overlap(dst, mm->src[1]) &&
++        (a0->data == dst->data || !ggml_metal_fusion_overlap(dst, a0)) &&
++        (a1 == NULL || a1->data == dst->data || !ggml_metal_fusion_overlap(dst, a1));
++}
++
+ // ---- patterns ------------------------------------------------------------
+ 
+ static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
+@@ -756,6 +878,8 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
+ };
+ 
+ static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
++static const std::vector<ggml_op> ops_mul_mat_add_add  = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD };
++static const std::vector<ggml_op> ops_mul_mat_add_gelu = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY };
+ 
+ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
+@@ -784,6 +908,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
++    { GGML_METAL_FUSION_MUL_MAT_EPI,    ops_mul_mat_add_add,        {},     false, ggml_metal_fusion_check_mul_mat_epi },
++    { GGML_METAL_FUSION_MUL_MAT_EPI,    ops_mul_mat_add_gelu,       {},     false, ggml_metal_fusion_check_mul_mat_epi },
++    { GGML_METAL_FUSION_MUL_MAT_EPI,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_epi },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+ };
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 5d994c2..cf21ae1 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -43,6 +43,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
+     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
+     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
++    GGML_METAL_FUSION_MUL_MAT_EPI,  // [macrophone] single-row q4_0 MUL_MAT + ADD [+ ADD | + GELU] in the mat-vec epilogue
+ } ggml_metal_fusion_id;
+ 
+ struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index e7c8956..9f2cb06 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -321,6 +321,11 @@ typedef struct {
+     uint64_t nb3;
+ } ggml_metal_kargs_cpy;
+ 
++// [macrophone] contiguous -> contiguous element-wise copy/convert (see kernel_cpy_flat)
++typedef struct {
++    int64_t n;
++} ggml_metal_kargs_cpy_flat;
++
+ typedef struct {
+     int64_t  ne10;
+     int64_t  ne11;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index dfe46ba..4b5a4f4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2223,6 +2223,33 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+ 
++    // [macrophone] fast path: contiguous F32/F16 -> contiguous F32/F16 with vector-aligned pointers
++    {
++        const ggml_type ts = op->src[0]->type;
++        const ggml_type td = op->type;
++        const bool types_ok = (ts == GGML_TYPE_F32 || ts == GGML_TYPE_F16) && (td == GGML_TYPE_F32 || td == GGML_TYPE_F16);
++        const bool aligned  = ((uintptr_t) op->src[0]->data) % (4*ggml_type_size(ts)) == 0 &&
++                              ((uintptr_t) op->data)         % (4*ggml_type_size(td)) == 0;
++        if (types_ok && aligned && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
++            ggml_nelements(op->src[0]) == ggml_nelements(op)) {
++            auto pipeline = ggml_metal_library_get_pipeline_cpy_flat(lib, ts, td);
++
++            ggml_metal_kargs_cpy_flat args = { /*.n =*/ ggml_nelements(op) };
++
++            const int64_t n_threads = ggml_nelements(op)/4 + 1;
++            const int     nth       = 256;
++
++            ggml_metal_encoder_set_pipeline(enc, pipeline);
++            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, (n_threads + nth - 1)/nth, 1, 1, nth, 1, 1);
++
++            return 1;
++        }
++    }
++
+     auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+ 
+     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
+@@ -2535,6 +2562,66 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
+     const int16_t r2 = ne12/ne02;
+     const int16_t r3 = ne13/ne03;
+ 
++    // [macrophone] single-row q4_0 mat-vec with the following bias/residual ADDs or GELU fused into its epilogue
++    if (op->src[0]->type == GGML_TYPE_Q4_0 && ne11 == 1) {
++        const int n_fuse = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_EPI);
++        if (n_fuse > 1) {
++            const ggml_tensor * n1  = ctx->node(idx + 1);
++            const ggml_tensor * a0  = n1->src[0] == op ? n1->src[1] : n1->src[0];
++            const ggml_tensor * a1  = nullptr;
++            const ggml_tensor * dst = n1;
++            bool gelu = false;
++            if (n_fuse > 2) {
++                const ggml_tensor * n2 = ctx->node(idx + 2);
++                if (n2->op == GGML_OP_ADD) {
++                    a1 = n2->src[0] == n1 ? n2->src[1] : n2->src[0];
++                } else {
++                    gelu = true;
++                }
++                dst = n2;
++            }
++
++            auto pipeline = ggml_metal_library_get_pipeline_mul_mv_q4_0_epi(lib, a1 ? 2 : 1, gelu);
++
++            const int nr0 = pipeline.nr0;
++            const int nsg = pipeline.nsg;
++
++            ggml_metal_kargs_mul_mv args = {
++                /*.ne00 =*/ ne00,
++                /*.ne01 =*/ ne01,
++                /*.ne02 =*/ ne02,
++                /*.nb00 =*/ nb00,
++                /*.nb01 =*/ nb01,
++                /*.nb02 =*/ nb02,
++                /*.nb03 =*/ nb03,
++                /*.ne10 =*/ ne10,
++                /*.ne11 =*/ ne11,
++                /*.ne12 =*/ ne12,
++                /*.nb10 =*/ nb10,
++                /*.nb11 =*/ nb11,
++                /*.nb12 =*/ nb12,
++                /*.nb13 =*/ nb13,
++                /*.ne0  =*/ ne0,
++                /*.ne1  =*/ ne1,
++                /*.nr0  =*/ nr0,
++                /*.r2   =*/ r2,
++                /*.r3   =*/ r3,
++            };
++
++            ggml_metal_encoder_set_pipeline(enc, pipeline);
++            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a0),         4);
++            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a1 ? a1 : a0), 5);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), 1, 1, 32, nsg, 1);
++
++            return n_fuse;
++        }
++    }
++
+     auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+ 
+     const int nr0 = pipeline.nr0;
+@@ -2730,7 +2817,33 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         //    default: break;
+         //}
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
++        // [macrophone] bias / bias + residual / bias + GELU fused into the tensor matmul's epilogue
++        int n_fuse = 1;
++        int epi    = 0;
++        const ggml_tensor * dst = op;
++        const ggml_tensor * e0  = op;
++        const ggml_tensor * e1  = op;
++        if (props_dev->has_tensor) {
++            n_fuse = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_EPI);
++            if (n_fuse > 1) {
++                const ggml_tensor * n1 = ctx->node(idx + 1);
++                e0  = n1->src[0] == op ? n1->src[1] : n1->src[0];
++                dst = n1;
++                epi = 1;
++                if (n_fuse > 2) {
++                    const ggml_tensor * n2 = ctx->node(idx + 2);
++                    if (n2->op == GGML_OP_ADD) {
++                        e1  = n2->src[0] == n1 ? n2->src[1] : n2->src[0];
++                        epi = 2;
++                    } else {
++                        epi = 3;
++                    }
++                    dst = n2;
++                }
++            }
++        }
++
++        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, epi);
+ 
+         ggml_metal_kargs_mul_mm args = {
+             /*.ne00 =*/ ne00,
+@@ -2753,7 +2866,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(e0),         4);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(e1),         5);
+ 
+         const size_t smem = pipeline.smem;
+ 
+@@ -2764,6 +2879,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         const int nsg = pipeline.nsg;
+ 
+         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
++
++        return n_fuse;
+     } else {
+         return ggml_metal_op_mul_mat_mv(ctx, idx);
+     }
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 9d262da..85edf11 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -9,6 +9,11 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
+ constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+ constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
+ 
++// [macrophone] fused epilogue of the tensor matmul (GGML_METAL_FUSION_MUL_MAT_EPI):
++// 0 = none, 1 = + bias[row], 2 = + bias[row] + residual, 3 = gelu(+ bias[row])
++constant short FC_mul_mm_epi [[function_constant(FC_MUL_MM + 7)]];
++constant short FC_mul_mm_epi_v = is_function_constant_defined(FC_mul_mm_epi) ? FC_mul_mm_epi : 0;
++
+ // each block_q contains 16*nl weights
+ #ifdef GGML_METAL_HAS_TENSOR
+ template<
+@@ -21,6 +26,8 @@ kernel void kernel_mul_mm(
+         device const char * srcA,
+         device const char * srcB,
+         device       char * dst,
++        device const char * srcE0,
++        device const char * srcE1,
+         threadgroup  char * shmem [[threadgroup(0)]],
+         uint3  tgpig [[threadgroup_position_in_grid]],
+         ushort tiitg [[thread_index_in_threadgroup]],
+@@ -133,6 +140,29 @@ kernel void kernel_mul_mm(
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
++    // [macrophone] epilogue on the accumulators, before the single store
++    if (FC_mul_mm_epi_v > 0) {
++        device const float * bias = (device const float *) srcE0;
++        device const float * res  = (device const float *) srcE1;
++        for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
++            if (cT.is_valid_element(i)) {
++                const auto ids = cT.get_multidimensional_index(i);
++                const int m = ra + ids[0];
++                const int n = rb + ids[1];
++                if (m < M && n < N) {
++                    float v = cT[i] + bias[m];
++                    if (FC_mul_mm_epi_v == 2) {
++                        v += res[(int64_t) n*M + m];
++                    }
++                    if (FC_mul_mm_epi_v == 3) {
++                        v = 0.5f*v*(1.0f + precise::tanh(SQRT_2_OVER_PI*v*(1.0f + GELU_COEF_A*v*v)));
++                    }
++                    cT[i] = v;
++                }
++            }
++        }
++    }
++
+     // Store result tile to output matrix (with batch offset)
+     // cT.store handles bounds checking via tD's extents (M, N)
+     device float * dstBatch = (device float *)dst + im * N * M;
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 0d1069f..5c65af0 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -474,6 +474,86 @@ kernel void kernel_mul_mv_q4_0_f32(
+     mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
++// [macrophone] kernel_mul_mv_q4_0_f32 with a fused epilogue: dst = [gelu](W x + a0 [+ a1]), see GGML_METAL_FUSION_MUL_MAT_EPI
++constant short FC_mul_mv_epi_n    [[function_constant(FC_MUL_MV + 6)]];
++constant bool  FC_mul_mv_epi_gelu [[function_constant(FC_MUL_MV + 7)]];
++
++kernel void kernel_mul_mv_q4_0_f32_epi(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        device const char * add0,
++        device const char * add1,
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NR0 = N_R0_Q4_0;
++    constexpr short NW  = N_SIMDWIDTH;
++    constexpr short NQ  = 16;
++
++    const int nb = args.ne00/QK4_0;
++    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
++
++    device const float * y = (device const float *) src1;
++
++    device const block_q4_0 * ax[NR0];
++    FOR_UNROLL (int row = 0; row < NR0; ++row) {
++        ax[row] = (device const block_q4_0 *) ((device char *) src0 + (uint64_t) (r0 + row)*args.nb01);
++    }
++
++    float sumf[NR0] = {0.f};
++
++    const short ix = (tiisg/(NW/NQ));
++    const short il = (tiisg%(NW/NQ))*8;
++
++    float yl[16];
++    device const float * yb = y + ix*QK4_0 + il;
++
++    for (int ib = ix; ib < nb; ib += NQ) {
++        float sumy[2] = { 0.f, 0.f };
++
++        FOR_UNROLL (short i = 0; i < 8; i += 2) {
++            sumy[0]  += yb[i +  0] + yb[i +  1];
++            yl[i + 0] = yb[i +  0];
++            yl[i + 1] = yb[i +  1]/256.f;
++
++            sumy[1]  += yb[i + 16] + yb[i + 17];
++            yl[i + 8] = yb[i + 16]/16.f;
++            yl[i + 9] = yb[i + 17]/4096.f;
++        }
++
++        FOR_UNROLL (short row = 0; row < NR0; row++) {
++            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
++        }
++
++        yb += QK4_0 * 16;
++    }
++
++    device       float * dst_f32 = (device       float *) dst;
++    device const float * a0_f32  = (device const float *) add0;
++    device const float * a1_f32  = (device const float *) add1;
++
++    for (int row = 0; row < NR0; ++row) {
++        const float tot = simd_sum(sumf[row]);
++
++        if (tiisg == 0 && r0 + row < args.ne01) {
++            float v = tot;
++            if (FC_mul_mv_epi_n >= 1) {
++                v += a0_f32[r0 + row];
++            }
++            if (FC_mul_mv_epi_n >= 2) {
++                v += a1_f32[r0 + row];
++            }
++            if (FC_mul_mv_epi_gelu) {
++                v = 0.5f*v*(1.0f + precise::tanh(SQRT_2_OVER_PI*v*(1.0f + GELU_COEF_A*v*v)));
++            }
++            dst_f32[r0 + row] = v;
++        }
++    }
++}
++
+ kernel void kernel_mul_mv_q4_1_f32(
+         constant ggml_metal_kargs_mul_mv & args,
+         device const char * src0,
+diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
+index 73679b9..d0282fb 100644
+--- a/ggml/src/ggml-metal/kernels/quantize.metal
++++ b/ggml/src/ggml-metal/kernels/quantize.metal
+@@ -37,6 +37,33 @@ kernel void kernel_cpy_t_t(
+ 
+ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
+ 
++// [macrophone] Copy/convert between two contiguous tensors: 4 elements per thread with vector loads, no
++// per-element index decomposition. kernel_cpy_t_t does 64-bit div/mod chains for every element, which
++// makes large contiguous casts (e.g. Whisper's per-layer K/V to F16) ALU-bound at ~15 GB/s.
++template<typename T0, typename T0_4, typename T1, typename T1_4>
++kernel void kernel_cpy_flat(
++        constant ggml_metal_kargs_cpy_flat & args,
++        device  const char * src0,
++        device        char * dst,
++        uint tid [[thread_position_in_grid]]) {
++    const int64_t i4 = tid;
++    const int64_t n4 = args.n/4;
++    if (i4 < n4) {
++        ((device T1_4 *) dst)[i4] = (T1_4) ((device const T0_4 *) src0)[i4];
++    } else if (i4 == n4) {
++        for (int64_t i = 4*n4; i < args.n; ++i) {
++            ((device T1 *) dst)[i] = (T1) ((device const T0 *) src0)[i];
++        }
++    }
++}
++
++typedef decltype(kernel_cpy_flat<float, float4, half, half4>) kernel_cpy_flat_t;
++
++template [[host_name("kernel_cpy_flat_f32_f32")]] kernel kernel_cpy_flat_t kernel_cpy_flat<float, float4, float, float4>;
++template [[host_name("kernel_cpy_flat_f32_f16")]] kernel kernel_cpy_flat_t kernel_cpy_flat<float, float4, half,  half4>;
++template [[host_name("kernel_cpy_flat_f16_f16")]] kernel kernel_cpy_flat_t kernel_cpy_flat<half,  half4,  half,  half4>;
++template [[host_name("kernel_cpy_flat_f16_f32")]] kernel kernel_cpy_flat_t kernel_cpy_flat<half,  half4,  float, float4>;
++
+ template [[host_name("kernel_cpy_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   float>;
+ template [[host_name("kernel_cpy_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   half>;
+ template [[host_name("kernel_cpy_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   int32_t>;
+diff --git a/include/whisper.h b/include/whisper.h
+index 545084e..41fba12 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -303,6 +303,24 @@ extern "C" {
+                                int   n_len,
+                                int   n_mel);
+ 
++    // [macrophone] Silence-tail cache. Whisper encodes a fixed 30 s window; for short audio most of it is padding.
++    // whisper_macrophone_init_tail() encodes a window of pure silence once and keeps every encoder layer's K/V and
++    // the decoder's cross-attention K/V. Afterwards, whisper_macrophone_set_live(ctx, n, mode) makes the next
++    // encodes compute only the first n frames while attention still sees all 1500 (mode 2: every encoder
++    // layer + decoder; mode 1: decoder only). Requires flash attention. Also enables log-mel peak
++    // normalization (mel_peak, e.g. 1.5) so the silence level matches the cache. Returns 0 on success.
++    WHISPER_API int  whisper_macrophone_init_tail(struct whisper_context * ctx, float mel_peak, int n_threads);
++    WHISPER_API void whisper_macrophone_set_live(struct whisper_context * ctx, int n_live, int mode);
++    WHISPER_API void whisper_macrophone_set_mel_peak(struct whisper_context * ctx, float mel_peak);
++    // [macrophone] Encoder matmuls use F16 activations from this many frames up (0 = never; default 256).
++    WHISPER_API void whisper_macrophone_set_f16_act_min(struct whisper_context * ctx, int n_frames);
++    WHISPER_API void whisper_macrophone_get_timings(struct whisper_context * ctx, float * out_ms, int * out_n);
++    // [macrophone] Draft tokens for the next whisper_full (greedy, single decoder): typically the tokens of a
++    // previous pass over a prefix of the same audio. Matching tokens are verified in one batched decode
++    // instead of one decoder step each. Pass n_tokens = 0 to clear.
++    WHISPER_API void whisper_macrophone_set_draft(struct whisper_context * ctx, const whisper_token * tokens, int n_tokens);
++    WHISPER_API void whisper_macrophone_draft_stats(struct whisper_context * ctx, int * accepted, int * batches);
++
+     // Run the Whisper encoder on the log mel spectrogram stored inside the default state in the provided whisper context.
+     // Make sure to call whisper_pcm_to_mel() or whisper_set_mel() first.
+     // offset can be used to specify the offset of the first frame in the spectrogram.
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 1675f33..b46b101 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -1,4 +1,8 @@
+ #include "whisper.h"
++
++#if defined(__APPLE__)
++#include <Accelerate/Accelerate.h> // [macrophone] vectorized softmax in whisper_process_logits
++#endif
+ #include "whisper-arch.h"
+ 
+ #include "ggml.h"
+@@ -888,6 +892,40 @@ struct whisper_state {
+     std::vector<float> inp_mel;
+     std::vector<float> inp_mask;
+ 
++    // [macrophone] flash-attention mask for the encoder's padded K/V (see KQ_mask_enc), cached per shape
++    std::vector<ggml_fp16_t> inp_mask_enc;
++    int                      inp_mask_enc_q     = 0;
++    int                      inp_mask_enc_valid = 0;
++
++    // [macrophone] silence-tail cache. Whisper always encodes a 30 s window; for a short utterance most of it
++    // is padding silence whose encoder states barely depend on the speech. With macrophone_live > 0 only the
++    // first macrophone_live frames are computed: every encoder layer's attention still sees all 1500 keys
++    // (the tail K/V come from an encode of pure silence) and so does the decoder's cross-attention.
++    int   macrophone_live      = 0;     // live encoder frames, 0 = off (stock behavior)
++    int   macrophone_tail_mode = 2;     // 1 = decoder cross K/V only, 2 = every encoder layer + decoder
++    float macrophone_mel_peak  = 0.0f;  // != 0: shift the log-mel so its peak is this value (fixes the silence level)
++    int   macrophone_f16_act_min = 256; // encoder matmuls take F16 activations when computing at least this many frames (0 = never)
++    bool  macrophone_capture   = false; // true while building the cache
++
++    ggml_context *        macrophone_cache_ctx = nullptr;
++    ggml_backend_buffer_t macrophone_cache_buf = nullptr;
++    ggml_tensor *         macrophone_enc_k     = nullptr; // [n_audio_state * pad(n_audio_ctx) * n_audio_layer]
++    ggml_tensor *         macrophone_enc_v     = nullptr;
++    ggml_tensor *         macrophone_cross_k   = nullptr; // same layout as kv_cross
++    ggml_tensor *         macrophone_cross_v   = nullptr;
++
++    // [macrophone] speculative greedy decoding: a draft of the expected tokens (e.g. the previous pass over the
++    // same audio) is verified in one batched decode; rows of matching tokens are then consumed without
++    // running the decoder again (see whisper_macrophone_spec_prepare)
++    std::vector<whisper_token> macrophone_draft;
++
++    // [macrophone] token ids suppressed by suppress_nst (looked up once)
++    std::vector<whisper_token> macrophone_nst_ids;
++    int macrophone_spec_row      = 0; // next precomputed logits row
++    int macrophone_spec_rows     = 0; // precomputed rows still pending
++    int macrophone_spec_accepted = 0;
++    int macrophone_spec_batches  = 0;
++
+     // decode output (2-dimensional array: [n_tokens][n_vocab])
+     std::vector<float> logits;
+ 
+@@ -2015,13 +2053,34 @@ static bool whisper_cross_external(const whisper_state & wstate) {
+     return use_vitisai_cross;
+ }
+ 
++// [macrophone] is the silence-tail cache in use for this encode?
++static bool whisper_macrophone_live(const whisper_state & wstate) {
++    return wstate.macrophone_live > 0 && wstate.macrophone_cross_k != nullptr && !wstate.macrophone_capture;
++}
++
++// [macrophone] encoder frames actually computed
++static int whisper_macrophone_enc_frames(const whisper_context & wctx, const whisper_state & wstate) {
++    if (whisper_macrophone_live(wstate)) {
++        return wstate.macrophone_live;
++    }
++    return wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++}
++
++// [macrophone] encoder frames the decoder cross-attends to
++static int whisper_macrophone_dec_frames(const whisper_context & wctx, const whisper_state & wstate) {
++    if (whisper_macrophone_live(wstate)) {
++        return wctx.model.hparams.n_audio_ctx;
++    }
++    return wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++}
++
+ static struct ggml_cgraph * whisper_build_graph_conv(
+         whisper_context & wctx,
+           whisper_state & wstate) {
+     const auto & model   = wctx.model;
+     const auto & hparams = model.hparams;
+ 
+-    const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
++    const int n_ctx   = whisper_macrophone_enc_frames(wctx, wstate);
+     const int n_state = hparams.n_audio_state; GGML_UNUSED(n_state);
+ 
+     const int n_mels = hparams.n_mels;
+@@ -2083,7 +2142,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+     const auto & model   = wctx.model;
+     const auto & hparams = model.hparams;
+ 
+-    const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
++    const int n_ctx   = whisper_macrophone_enc_frames(wctx, wstate); // queries (frames computed)
+     const int n_state = hparams.n_audio_state;
+     const int n_head  = hparams.n_audio_head;
+     const int n_layer = hparams.n_audio_layer;
+@@ -2094,7 +2153,12 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+ 
+     WHISPER_ASSERT(!!kv_pad.buffer);
+ 
+-    const int n_ctx_pad = GGML_PAD(n_ctx, 256);
++    // [macrophone] with the silence tail the queries still attend to all n_audio_ctx keys
++    const bool macrophone_tail = whisper_macrophone_live(wstate) && wstate.macrophone_tail_mode >= 2;
++    const int  n_kv       = macrophone_tail ? hparams.n_audio_ctx : n_ctx;
++    const int  n_cache_pad = GGML_PAD(hparams.n_audio_ctx, 256);
++
++    const int n_ctx_pad = GGML_PAD(n_kv, 256);
+ 
+     struct ggml_init_params params = {
+         /*.mem_size   =*/ wstate.sched_encode.meta.size(),
+@@ -2135,8 +2199,24 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+     // original:
+     //cur = ggml_add(ctx0, model.e_pe, ggml_transpose(ctx0, cur));
+ 
++    // [macrophone] the flash-attention path attends over GGML_PAD(n_ctx, 256) keys, but only n_ctx are written
++    // per encode; the rest are zeros (full window) or stale keys from an earlier, longer encode (reduced
++    // audio_ctx), which leaks earlier audio into this one. Mask them out.
++    struct ggml_tensor * KQ_mask_enc = nullptr;
++    if (wctx.params.flash_attn && n_ctx_pad != n_kv) {
++        KQ_mask_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_ctx_pad, n_ctx);
++        ggml_set_name(KQ_mask_enc, "KQ_mask_enc");
++        ggml_set_input(KQ_mask_enc);
++    }
++
+     struct ggml_tensor * inpL = cur;
+ 
++    // [macrophone] the M5 tensor (Neural Accelerator) matmul reads its activation operand straight from device
++    // memory: F16 instead of F32 halves that traffic (up to +68% throughput on the 5120-wide projections).
++    // The casts cost a few small kernels per layer, so only for longer inputs.
++    const bool f16_act = wctx.params.flash_attn && wstate.macrophone_f16_act_min > 0 && n_ctx >= wstate.macrophone_f16_act_min;
++    auto act = [&](struct ggml_tensor * t) { return f16_act ? ggml_cast(ctx0, t, GGML_TYPE_F16) : t; };
++
+     for (int il = 0; il < n_layer; ++il) {
+         const auto & layer = model.layers_encoder[il];
+ 
+@@ -2152,6 +2232,8 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+ 
+         // self-attention
+         {
++            cur = act(cur);
++
+             struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
+                     layer.attn_q_w,
+                     cur);
+@@ -2184,6 +2266,29 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, ggml_view_1d(ctx0, kv_pad.k, n_ctx*n_state, 0)));
+                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, ggml_view_1d(ctx0, kv_pad.v, n_ctx*n_state, 0)));
+ 
++                // [macrophone] keys/values of the silent tail frames come from the cache
++                if (macrophone_tail && n_kv > n_ctx) {
++                    const size_t  es     = ggml_element_size(kv_pad.k);
++                    const int64_t n_tail = (int64_t) (n_kv - n_ctx)*n_state;
++                    const size_t  src    = es*((size_t) il*n_cache_pad*n_state + (size_t) n_ctx*n_state);
++                    const size_t  dst    = es*((size_t) n_ctx*n_state);
++
++                    ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++                                ggml_view_1d(ctx0, wstate.macrophone_enc_k, n_tail, src),
++                                ggml_view_1d(ctx0, kv_pad.k, n_tail, dst)));
++                    ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++                                ggml_view_1d(ctx0, wstate.macrophone_enc_v, n_tail, src),
++                                ggml_view_1d(ctx0, kv_pad.v, n_tail, dst)));
++                }
++
++                // [macrophone] building the cache: keep this layer's K/V
++                if (wstate.macrophone_capture) {
++                    const size_t off = ggml_element_size(wstate.macrophone_enc_k)*((size_t) il*n_cache_pad*n_state);
++
++                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, ggml_view_1d(ctx0, wstate.macrophone_enc_k, n_ctx*n_state, off)));
++                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, ggml_view_1d(ctx0, wstate.macrophone_enc_v, n_ctx*n_state, off)));
++                }
++
+                 struct ggml_tensor * K =
+                     ggml_view_3d(ctx0, kv_pad.k,
+                             n_state_head, n_ctx_pad, n_head,
+@@ -2198,7 +2303,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+                             ggml_element_size(kv_pad.v)*n_state_head,
+                             0);
+ 
+-                cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
++                cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask_enc, KQscale, 0.0f, 0.0f);
+ 
+                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
+             } else {
+@@ -2235,7 +2340,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+         {
+             cur = ggml_mul_mat(ctx0,
+                     layer.attn_ln_1_w,
+-                    cur);
++                    act(cur));
+ 
+             cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
+         }
+@@ -2260,7 +2365,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+             // fully connected
+             cur = ggml_mul_mat(ctx0,
+                     layer.mlp_0_w,
+-                    cur);
++                    act(cur));
+ 
+             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+ 
+@@ -2270,7 +2375,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+             // projection
+             cur = ggml_mul_mat(ctx0,
+                     layer.mlp_1_w,
+-                    cur);
++                    act(cur));
+ 
+             cur = ggml_add(ctx0, cur, layer.mlp_1_b);
+         }
+@@ -2317,13 +2422,17 @@ static struct ggml_cgraph * whisper_build_graph_cross(
+     const auto & model   = wctx.model;
+     const auto & hparams = model.hparams;
+ 
+-    const int n_ctx   = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
++    const int n_ctx   = whisper_macrophone_enc_frames(wctx, wstate); // frames computed by this encode
+     const int n_state = hparams.n_audio_state;
+     const int n_head  = hparams.n_audio_head;
+ 
+     const int n_state_head = n_state/n_head;
+ 
+-    const int n_ctx_pad = GGML_PAD(n_ctx, 256);
++    // [macrophone] with the silence tail the decoder sees all n_audio_ctx frames: the rest come from the cache
++    const bool macrophone_live = whisper_macrophone_live(wstate);
++    const int  n_dec      = whisper_macrophone_dec_frames(wctx, wstate);
++
++    const int n_ctx_pad = GGML_PAD(n_dec, 256);
+ 
+     struct ggml_init_params params = {
+         /*.mem_size   =*/ wstate.sched_cross.meta.size(),
+@@ -2380,6 +2489,19 @@ static struct ggml_cgraph * whisper_build_graph_cross(
+ 
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcross, k));
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcross, v));
++
++        if (macrophone_live && wctx.params.flash_attn && n_dec > n_ctx) {
++            const size_t  es     = ggml_element_size(wstate.kv_cross.k);
++            const int64_t n_tail = (int64_t) (n_dec - n_ctx)*n_state;
++            const size_t  off    = es*n_state*((size_t) il*n_ctx_pad + n_ctx);
++
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++                        ggml_view_1d(ctx0, wstate.macrophone_cross_k, n_tail, off),
++                        ggml_view_1d(ctx0, wstate.kv_cross.k,    n_tail, off)));
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++                        ggml_view_1d(ctx0, wstate.macrophone_cross_v, n_tail, off),
++                        ggml_view_1d(ctx0, wstate.kv_cross.v,    n_tail, off)));
++        }
+     }
+ 
+     //ggml_graph_print(gf);
+@@ -2424,7 +2546,7 @@ static bool whisper_encode_internal(
+         // set the input
+         {
+             const auto & mel_inp = wstate.mel;
+-            const int n_ctx      = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++            const int n_ctx      = whisper_macrophone_enc_frames(wctx, wstate);
+ 
+             assert(mel->type == GGML_TYPE_F32);
+             assert(mel_inp.n_mel == wctx.model.hparams.n_mels);
+@@ -2491,6 +2613,28 @@ static bool whisper_encode_internal(
+             return false;
+         }
+ 
++        // [macrophone] see KQ_mask_enc in whisper_build_graph_encoder
++        if (struct ggml_tensor * mask = ggml_graph_get_tensor(gf, "KQ_mask_enc")) {
++            const int n_kv    = (int) mask->ne[0];
++            const int n_q     = (int) mask->ne[1];
++            const int n_valid = whisper_macrophone_live(wstate) && wstate.macrophone_tail_mode >= 2 ? wctx.model.hparams.n_audio_ctx : n_q;
++
++            if (wstate.inp_mask_enc_q != n_q || wstate.inp_mask_enc_valid != n_valid || wstate.inp_mask_enc.size() != (size_t) n_kv*n_q) {
++                std::vector<ggml_fp16_t> row(n_kv);
++                for (int i = 0; i < n_kv; ++i) {
++                    row[i] = ggml_fp32_to_fp16(i < n_valid ? 0.0f : -INFINITY);
++                }
++                wstate.inp_mask_enc.resize((size_t) n_kv*n_q);
++                for (int j = 0; j < n_q; ++j) {
++                    memcpy(wstate.inp_mask_enc.data() + (size_t) j*n_kv, row.data(), n_kv*sizeof(ggml_fp16_t));
++                }
++                wstate.inp_mask_enc_q     = n_q;
++                wstate.inp_mask_enc_valid = n_valid;
++            }
++
++            ggml_backend_tensor_set(mask, wstate.inp_mask_enc.data(), 0, ggml_nbytes(mask));
++        }
++
+         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+             return false;
+         }
+@@ -2510,6 +2654,12 @@ static bool whisper_encode_internal(
+         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+             return false;
+         }
++
++        // [macrophone] building the cache: keep the decoder's cross K/V of the silent window
++        if (wstate.macrophone_capture && wstate.macrophone_cross_k != nullptr) {
++            ggml_backend_tensor_copy(wstate.kv_cross.k, wstate.macrophone_cross_k);
++            ggml_backend_tensor_copy(wstate.kv_cross.v, wstate.macrophone_cross_v);
++        }
+     }
+ 
+     wstate.t_encode_us += ggml_time_us() - t_start_us;
+@@ -2539,7 +2689,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
+     const int n_state_head = n_state/n_head;
+ 
+     const int n_tokens    = batch.n_tokens;
+-    const int n_audio_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
++    const int n_audio_ctx = whisper_macrophone_dec_frames(wctx, wstate);
+ 
+     const int n_audio_ctx_pad = GGML_PAD(n_audio_ctx, 256);
+ 
+@@ -2574,6 +2724,18 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
+ 
+     struct ggml_tensor * KQ_mask_f16 = ggml_cast(ctx0, KQ_mask, GGML_TYPE_F16);
+ 
++    // [macrophone] with flash attention the cross-attention K/V views span GGML_PAD(n_audio_ctx, 256) frames,
++    // but the encoder only writes n_audio_ctx of them: the rest hold stale frames from earlier (longer)
++    // encodes. Mask them out, otherwise a reduced audio_ctx decodes text from previous audio.
++    struct ggml_tensor * KQ_mask_cross_f16 = nullptr;
++    if (wctx.params.flash_attn && n_audio_ctx_pad != n_audio_ctx) {
++        struct ggml_tensor * KQ_mask_cross = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_audio_ctx_pad, n_tokens, 1);
++        ggml_set_name(KQ_mask_cross, "KQ_mask_cross");
++        ggml_set_input(KQ_mask_cross);
++
++        KQ_mask_cross_f16 = ggml_cast(ctx0, KQ_mask_cross, GGML_TYPE_F16);
++    }
++
+     // token encoding + position encoding
+     struct ggml_tensor * cur =
+         ggml_add(ctx0,
+@@ -2755,7 +2917,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
+                             ggml_element_size(wstate.kv_cross.v)*n_state_head,
+                             ggml_element_size(wstate.kv_cross.v)*n_state*n_audio_ctx_pad*il);
+ 
+-                cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr, KQscale, 0.0f, 0.0f);
++                cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, KQ_mask_cross_f16, KQscale, 0.0f, 0.0f);
+ 
+                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
+             } else {
+@@ -3002,6 +3164,21 @@ static bool whisper_decode_internal(
+             ggml_backend_tensor_set(KQ_mask, wstate.inp_mask.data(), 0, ggml_nelements(KQ_mask)*sizeof(float));
+         }
+ 
++        // [macrophone] see KQ_mask_cross in whisper_build_graph_decoder
++        if (struct ggml_tensor * KQ_mask_cross = ggml_graph_get_tensor(gf, "KQ_mask_cross")) {
++            const int n_audio_ctx = whisper_macrophone_dec_frames(wctx, wstate);
++            const int n_pad       = (int) KQ_mask_cross->ne[0];
++
++            std::vector<float> mask(ggml_nelements(KQ_mask_cross));
++            for (int j = 0; j < n_tokens; ++j) {
++                for (int i = 0; i < n_pad; ++i) {
++                    mask[(size_t) j*n_pad + i] = i < n_audio_ctx ? 0.0f : -INFINITY;
++                }
++            }
++
++            ggml_backend_tensor_set(KQ_mask_cross, mask.data(), 0, ggml_nbytes(KQ_mask_cross));
++        }
++
+         logits = ggml_graph_node(gf, -1);
+ 
+         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+@@ -3229,6 +3406,79 @@ static void log_mel_spectrogram_worker_thread(int ith, const float * hann, const
+     }
+ }
+ 
++#if defined(__APPLE__)
++// [macrophone] The same STFT power spectrum + mel filterbank + log10 as log_mel_spectrogram_worker_thread, as two
++// SGEMMs on Accelerate (AMX/SME): frames[n x 400] x DFT basis[400 x 2*201], then filters[128 x 201] x power^T.
++// One thread and ~1 ms for 25 s of audio, instead of n_threads freshly spawned threads running a scalar FFT.
++// (The classic cblas_sgemm interface is marked deprecated in favor of ACCELERATE_NEW_LAPACK; kept as is.)
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++static void whisper_macrophone_mel_gemm(const float * hann, const std::vector<float> & samples, int n_samples,
++                                   int frame_size, int frame_step, const whisper_filters & filters, whisper_mel & mel) {
++    const int n_fft    = filters.n_fft;
++    const int n_frames = std::max(0, std::min(n_samples / frame_step + 1, mel.n_len));
++
++    static std::vector<float> basis; // [frame_size x 2*n_fft]: cos | -sin
++    static std::once_flag     basis_once;
++    std::call_once(basis_once, [&]() {
++        basis.resize((size_t) frame_size*2*n_fft);
++        for (int j = 0; j < frame_size; ++j) {
++            for (int k = 0; k < n_fft; ++k) {
++                const double t = 2.0*M_PI*(double) ((j*k) % frame_size)/frame_size;
++                basis[(size_t) j*2*n_fft + k]         = (float)  cos(t);
++                basis[(size_t) j*2*n_fft + n_fft + k] = (float) -sin(t);
++            }
++        }
++    });
++
++    std::vector<float> frames((size_t) n_frames*frame_size);
++    for (int i = 0; i < n_frames; ++i) {
++        const int offset = i*frame_step;
++        const int n      = std::max(0, std::min(frame_size, n_samples - offset));
++        float * f = frames.data() + (size_t) i*frame_size;
++        if (n > 0) {
++            vDSP_vmul(samples.data() + offset, 1, hann, 1, f, 1, n);
++        }
++        std::fill(f + n, f + frame_size, 0.0f);
++    }
++
++    std::vector<float> spec((size_t) n_frames*2*n_fft);
++    if (n_frames > 0) {
++        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n_frames, 2*n_fft, frame_size,
++                    1.0f, frames.data(), frame_size, basis.data(), 2*n_fft, 0.0f, spec.data(), 2*n_fft);
++    }
++
++    std::vector<float> power((size_t) n_frames*n_fft);
++    for (int i = 0; i < n_frames; ++i) {
++        const float * re = spec.data() + (size_t) i*2*n_fft;
++        const float * im = re + n_fft;
++        float * pw = power.data() + (size_t) i*n_fft;
++        for (int k = 0; k < n_fft; ++k) {
++            pw[k] = re[k]*re[k] + im[k]*im[k];
++        }
++    }
++
++    // mel.data is [n_mel x n_len]; write the computed frames' block directly (row stride n_len)
++    if (n_frames > 0) {
++        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, mel.n_mel, n_frames, n_fft,
++                    1.0f, filters.data.data(), n_fft, power.data(), n_fft, 0.0f, mel.data.data(), mel.n_len);
++    }
++
++    const float floor_v = 1e-10f;
++    const float floor_l = log10f(floor_v);
++    for (int j = 0; j < mel.n_mel; ++j) {
++        float * row = mel.data.data() + (size_t) j*mel.n_len;
++        if (n_frames > 0) {
++            vDSP_vthr(row, 1, &floor_v, row, 1, n_frames);
++            int n = n_frames;
++            vvlog10f(row, row, &n);
++        }
++        std::fill(row + n_frames, row + mel.n_len, floor_l);
++    }
++}
++#pragma clang diagnostic pop
++#endif
++
+ // ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L110-L157
+ static bool log_mel_spectrogram(
+               whisper_state & wstate,
+@@ -3250,6 +3500,13 @@ static bool log_mel_spectrogram(
+ 
+     // Calculate the length of padding
+     int64_t stage_1_pad = WHISPER_SAMPLE_RATE * 30;
++
++    // [macrophone] with the silence-tail cache the encoder reads only 2*macrophone_live mel frames, so only pad
++    // with enough digital silence to cover them (instead of a full 30 s)
++    if (wstate.macrophone_live > 0 && wstate.macrophone_cross_k != nullptr) {
++        const int64_t needed = (int64_t) 2*wstate.macrophone_live*frame_step + frame_size - n_samples;
++        stage_1_pad = std::min<int64_t>(stage_1_pad, std::max<int64_t>(needed, frame_size));
++    }
+     int64_t stage_2_pad = frame_size / 2;
+ 
+     // Initialize a vector and copy data from C array to it.
+@@ -3275,6 +3532,11 @@ static bool log_mel_spectrogram(
+     mel.n_len_org = 1 + (n_samples + stage_2_pad - frame_size) / frame_step;
+     mel.data.resize(mel.n_mel * mel.n_len);
+ 
++#if defined(__APPLE__)
++    if (frame_size == WHISPER_N_FFT && filters.n_fft == 1 + frame_size/2) {
++        whisper_macrophone_mel_gemm(hann, samples_padded, n_samples + stage_2_pad, frame_size, frame_step, filters, mel);
++    } else
++#endif
+     {
+         std::vector<std::thread> workers(n_threads - 1);
+         for (int iw = 0; iw < n_threads - 1; ++iw) {
+@@ -3300,14 +3562,32 @@ static bool log_mel_spectrogram(
+         }
+     }
+ 
+-    mmax -= 8.0;
++    WHISPER_LOG_DEBUG("%s: [macrophone] log-mel peak = %.3f\n", __func__, mmax);
+ 
+-    for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
+-        if (mel.data[i] < mmax) {
+-            mel.data[i] = mmax;
++    if (wstate.macrophone_mel_peak != 0.0f) {
++        // [macrophone] gain-normalize: shift the log-mel so its peak is macrophone_mel_peak. Digital silence (the
++        // padding) then always lands on the same floor value, so one cached silence encode fits every
++        // utterance (see macrophone_live).
++        const double shift = (double) wstate.macrophone_mel_peak - mmax;
++        const double floor = (double) wstate.macrophone_mel_peak - 8.0;
++
++        for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
++            double v = mel.data[i] + shift;
++            if (v < floor) {
++                v = floor;
++            }
++            mel.data[i] = (v + 4.0)/4.0;
+         }
++    } else {
++        mmax -= 8.0;
++
++        for (int i = 0; i < mel.n_mel*mel.n_len; i++) {
++            if (mel.data[i] < mmax) {
++                mel.data[i] = mmax;
++            }
+ 
+-        mel.data[i] = (mel.data[i] + 4.0)/4.0;
++            mel.data[i] = (mel.data[i] + 4.0)/4.0;
++        }
+     }
+ 
+     wstate.t_mel_us += ggml_time_us() - t_start_us;
+@@ -3930,6 +4210,15 @@ void whisper_free_state(struct whisper_state * state) {
+         whisper_kv_cache_free(state->kv_cross);
+         whisper_kv_cache_free(state->kv_pad);
+ 
++        if (state->macrophone_cache_buf) {
++            ggml_backend_buffer_free(state->macrophone_cache_buf);
++            state->macrophone_cache_buf = nullptr;
++        }
++        if (state->macrophone_cache_ctx) {
++            ggml_free(state->macrophone_cache_ctx);
++            state->macrophone_cache_ctx = nullptr;
++        }
++
+ #ifdef WHISPER_USE_COREML
+         if (state->ctx_coreml != nullptr) {
+             whisper_coreml_free(state->ctx_coreml);
+@@ -4020,6 +4309,104 @@ int whisper_pcm_to_mel(struct whisper_context * ctx, const float * samples, int
+     return whisper_pcm_to_mel_with_state(ctx, ctx->state, samples, n_samples, n_threads);
+ }
+ 
++// [macrophone] silence-tail cache API (see macrophone_live in whisper_state)
++
++int whisper_macrophone_init_tail(struct whisper_context * ctx, float mel_peak, int n_threads) {
++    whisper_state * state = ctx->state;
++    if (state == nullptr || !ctx->params.flash_attn || mel_peak == 0.0f) {
++        return -1;
++    }
++
++    const auto & hp = ctx->model.hparams;
++    const int n_ctx = hp.n_audio_ctx;
++    const int n_pad = GGML_PAD(n_ctx, 256);
++
++    if (state->macrophone_cache_buf == nullptr) {
++        struct ggml_init_params params = {
++            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
++            /*.mem_buffer =*/ nullptr,
++            /*.no_alloc   =*/ true,
++        };
++        state->macrophone_cache_ctx = ggml_init(params);
++
++        state->macrophone_enc_k   = ggml_new_tensor_1d(state->macrophone_cache_ctx, state->kv_pad.k->type, (int64_t) hp.n_audio_state*n_pad*hp.n_audio_layer);
++        state->macrophone_enc_v   = ggml_new_tensor_1d(state->macrophone_cache_ctx, state->kv_pad.v->type, (int64_t) hp.n_audio_state*n_pad*hp.n_audio_layer);
++        state->macrophone_cross_k = ggml_new_tensor_1d(state->macrophone_cache_ctx, state->kv_cross.k->type, ggml_nelements(state->kv_cross.k));
++        state->macrophone_cross_v = ggml_new_tensor_1d(state->macrophone_cache_ctx, state->kv_cross.v->type, ggml_nelements(state->kv_cross.v));
++
++        state->macrophone_cache_buf = ggml_backend_alloc_ctx_tensors(state->macrophone_cache_ctx, state->backends[0]);
++        if (state->macrophone_cache_buf == nullptr) {
++            WHISPER_LOG_ERROR("%s: failed to allocate the silence-tail cache\n", __func__);
++            return -2;
++        }
++        ggml_backend_buffer_clear(state->macrophone_cache_buf, 0);
++
++        WHISPER_LOG_INFO("%s: silence-tail cache = %7.2f MB\n", __func__, ggml_backend_buffer_get_size(state->macrophone_cache_buf)/1e6);
++    }
++
++    state->macrophone_mel_peak = mel_peak;
++
++    // a full window of digital silence: after normalization every value is the floor
++    const float silence = (mel_peak - 8.0f + 4.0f)/4.0f;
++
++    state->mel.n_mel     = hp.n_mels;
++    state->mel.n_len     = 2*n_ctx;
++    state->mel.n_len_org = 2*n_ctx;
++    state->mel.data.assign((size_t) hp.n_mels*2*n_ctx, silence);
++
++    const int saved_exp = state->exp_n_audio_ctx;
++    state->exp_n_audio_ctx = 0;
++    state->macrophone_capture   = true;
++
++    const bool ok = whisper_encode_internal(*ctx, *state, 0, n_threads, nullptr, nullptr);
++
++    state->macrophone_capture   = false;
++    state->exp_n_audio_ctx = saved_exp;
++
++    return ok ? 0 : -3;
++}
++
++void whisper_macrophone_set_live(struct whisper_context * ctx, int n_live, int mode) {
++    if (ctx->state == nullptr) {
++        return;
++    }
++    const int n_ctx = ctx->model.hparams.n_audio_ctx;
++    ctx->state->macrophone_live      = (n_live > 0 && n_live < n_ctx && ctx->params.flash_attn) ? n_live : 0;
++    ctx->state->macrophone_tail_mode = mode;
++}
++
++void whisper_macrophone_set_draft(struct whisper_context * ctx, const whisper_token * tokens, int n_tokens) {
++    if (ctx->state == nullptr) {
++        return;
++    }
++    auto & st = *ctx->state;
++    st.macrophone_draft.assign(tokens, tokens + std::max(0, n_tokens));
++    st.macrophone_spec_rows     = 0;
++    st.macrophone_spec_row      = 0;
++    st.macrophone_spec_accepted = 0;
++    st.macrophone_spec_batches  = 0;
++}
++
++void whisper_macrophone_draft_stats(struct whisper_context * ctx, int * accepted, int * batches) {
++    if (ctx->state == nullptr) {
++        return;
++    }
++    *accepted = ctx->state->macrophone_spec_accepted;
++    *batches  = ctx->state->macrophone_spec_batches;
++}
++
++void whisper_macrophone_set_f16_act_min(struct whisper_context * ctx, int n_frames) {
++    if (ctx->state != nullptr) {
++        ctx->state->macrophone_f16_act_min = n_frames;
++    }
++}
++
++void whisper_macrophone_set_mel_peak(struct whisper_context * ctx, float mel_peak) {
++    if (ctx->state != nullptr) {
++        ctx->state->macrophone_mel_peak = mel_peak;
++    }
++}
++
+ int whisper_set_mel_with_state(
+         struct whisper_context * ctx,
+           struct whisper_state * state,
+@@ -4429,6 +4816,26 @@ void whisper_print_timings(struct whisper_context * ctx) {
+     WHISPER_LOG_INFO("%s:    total time = %8.2f ms\n", __func__, (t_end_us - ctx->t_start_us)/1000.0f);
+ }
+ 
++// [macrophone] totals since the last whisper_reset_timings, without allocating:
++// out[0..5] = mel, sample, encode, decode, batchd, prompt (ms); n[0..4] = sample, encode, decode, batchd, prompt counts
++void whisper_macrophone_get_timings(struct whisper_context * ctx, float * out, int * n) {
++    const whisper_state * st = ctx->state;
++    if (st == nullptr) {
++        return;
++    }
++    out[0] = 1e-3f*st->t_mel_us;
++    out[1] = 1e-3f*st->t_sample_us;
++    out[2] = 1e-3f*st->t_encode_us;
++    out[3] = 1e-3f*st->t_decode_us;
++    out[4] = 1e-3f*st->t_batchd_us;
++    out[5] = 1e-3f*st->t_prompt_us;
++    n[0] = st->n_sample;
++    n[1] = st->n_encode;
++    n[2] = st->n_decode;
++    n[3] = st->n_batchd;
++    n[4] = st->n_prompt;
++}
++
+ void whisper_reset_timings(struct whisper_context * ctx) {
+     ctx->t_start_us = ggml_time_us();
+     if (ctx->state != nullptr) {
+@@ -6299,6 +6706,27 @@ static void whisper_compute_logprobs(
+                 const std::vector<float> & logits,
+                               const int    n_logits,
+                       std::vector<float> & logprobs) {
++#if defined(__APPLE__)
++    // [macrophone] same result as below, vectorized: this runs over the whole vocabulary on every decoder step
++    {
++        float logit_max;
++        vDSP_maxv(logits.data(), 1, &logit_max, n_logits);
++
++        static thread_local std::vector<float> tmp;
++        tmp.resize(n_logits);
++
++        const float neg_max = -logit_max;
++        vDSP_vsadd(logits.data(), 1, &neg_max, logprobs.data(), 1, n_logits); // -inf stays -inf
++        int n = n_logits;
++        vvexpf(tmp.data(), logprobs.data(), &n);                             // exp(-inf) = 0
++        float sum = 0.0f;
++        vDSP_sve(tmp.data(), 1, &sum, n_logits);
++
++        const float neg_lse = -(logf(sum) + logit_max);
++        vDSP_vsadd(logits.data(), 1, &neg_lse, logprobs.data(), 1, n_logits);
++        return;
++    }
++#endif
+     const float logit_max = *std::max_element(logits.begin(), logits.end());
+     float logsumexp = 0.0f;
+     for (int i = 0; i < n_logits; ++i) {
+@@ -6322,6 +6750,14 @@ static void whisper_compute_probs(
+                   const int    n_logits,
+     const std::vector<float> & logprobs,
+           std::vector<float> & probs)     {
++#if defined(__APPLE__)
++    {
++        GGML_UNUSED(logits);
++        int n = n_logits;
++        vvexpf(probs.data(), logprobs.data(), &n); // logprobs is -inf exactly where logits is -inf
++        return;
++    }
++#endif
+     for (int i = 0; i < n_logits; ++i) {
+         if (logits[i] == -INFINITY) {
+             probs[i] = 0.0f;
+@@ -6437,21 +6873,29 @@ static void whisper_process_logits(
+         // suppress non-speech tokens
+         // ref: https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/tokenizer.py#L224-L253
+         if (params.suppress_nst) {
+-            for (const std::string & token : non_speech_tokens) {
+-                const std::string suppress_tokens[] = {token, " " + token};
+-                for (const std::string & suppress_token : suppress_tokens) {
+-                    if (vocab.token_to_id.find(suppress_token) != vocab.token_to_id.end()) {
+-                        logits[vocab.token_to_id.at(suppress_token)] = -INFINITY;
++            // [macrophone] the ids never change: look them up once per state instead of ~180 string-map
++            // lookups on every decoder step
++            if (state.macrophone_nst_ids.empty()) {
++                for (const std::string & token : non_speech_tokens) {
++                    const std::string suppress_tokens[] = {token, " " + token};
++                    for (const std::string & suppress_token : suppress_tokens) {
++                        const auto it = vocab.token_to_id.find(suppress_token);
++                        if (it != vocab.token_to_id.end()) {
++                            state.macrophone_nst_ids.push_back(it->second);
++                        }
+                     }
+                 }
+-            }
+ 
+-            // allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
+-            if (vocab.token_to_id.find(" -") != vocab.token_to_id.end()) {
+-                logits[vocab.token_to_id.at(" -")] = -INFINITY;
++                // allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
++                for (const char * t : { " -", " '" }) {
++                    const auto it = vocab.token_to_id.find(t);
++                    if (it != vocab.token_to_id.end()) {
++                        state.macrophone_nst_ids.push_back(it->second);
++                    }
++                }
+             }
+-            if (vocab.token_to_id.find(" '") != vocab.token_to_id.end()) {
+-                logits[vocab.token_to_id.at(" '")] = -INFINITY;
++            for (const whisper_token id : state.macrophone_nst_ids) {
++                logits[id] = -INFINITY;
+             }
+         }
+ 
+@@ -6661,6 +7105,17 @@ static whisper_token_data whisper_sample_token(
+     }
+ 
+     if (best) {
++#if defined(__APPLE__)
++        // [macrophone] vectorized argmax (first maximum, same as the loop below)
++        float       pmax = 0.0f;
++        vDSP_Length imax = 0;
++        vDSP_maxvi(probs.data(), 1, &pmax, &imax, n_logits);
++        if (pmax > 0.0f) {
++            result.id   = (whisper_token) imax;
++            result.p    = pmax;
++            result.plog = logprobs[imax];
++        }
++#else
+         for (int i = 0; i < n_logits; ++i) {
+             if (result.p < probs[i]) {
+                 result.id   = i;
+@@ -6668,6 +7123,7 @@ static whisper_token_data whisper_sample_token(
+                 result.plog = logprobs[i];
+             }
+         }
++#endif
+     } else {
+         std::discrete_distribution<> dist(probs.begin(), probs.end());
+ 
+@@ -6970,6 +7426,74 @@ static bool whisper_vad(
+     return true;
+ }
+ 
++// [macrophone] Decide how to get the logits for the next step of a single greedy decoder.
++// Returns true if it took care of it: either a precomputed row is valid (skip_decode = true), or it filled
++// state.batch with [last token, draft...] for one batched decode whose rows the next steps can reuse.
++static bool whisper_macrophone_spec_prepare(
++        whisper_state & state,
++        whisper_decoder & decoder,
++        const int n_past,
++        bool & skip_decode) {
++    skip_decode = false;
++
++    auto & draft = state.macrophone_draft;
++    if (draft.empty()) {
++        return false;
++    }
++
++    const auto & seq  = decoder.sequence.tokens;
++    const int    L    = (int) seq.size();
++    const auto   last = seq.back().id;
++
++    if (state.macrophone_spec_rows > 0) {
++        // the pending row was computed with draft[L - 1] as input: valid iff that's what was sampled
++        if (L - 1 < (int) draft.size() && last == draft[L - 1]) {
++            decoder.i_batch = state.macrophone_spec_row++;
++            state.macrophone_spec_rows--;
++            state.macrophone_spec_accepted++;
++            skip_decode = true;
++            return true;
++        }
++
++        // diverged: the cache holds unverified draft tokens from n_past on
++        whisper_kv_cache_seq_rm(state.kv_self, 0, n_past, -1);
++        state.macrophone_spec_rows = 0;
++        draft.clear();
++        return false;
++    }
++
++    // start a batched verification only while the sequence still matches the draft
++    if (L >= (int) draft.size()) {
++        return false;
++    }
++    for (int k = 0; k < L; ++k) {
++        if (seq[k].id != draft[k]) {
++            draft.clear();
++            return false;
++        }
++    }
++
++    auto & batch = state.batch;
++    const int n_draft = std::min((int) draft.size() - L, 128);
++
++    batch.n_tokens = 0;
++    for (int k = 0; k <= n_draft; ++k) {
++        batch.token   [batch.n_tokens]    = k == 0 ? last : draft[L + k - 1];
++        batch.pos     [batch.n_tokens]    = n_past + k;
++        batch.n_seq_id[batch.n_tokens]    = 1;
++        batch.seq_id  [batch.n_tokens][0] = 0;
++        batch.logits  [batch.n_tokens]    = 1;
++        batch.n_tokens++;
++    }
++
++    decoder.i_batch       = 0;
++    state.macrophone_spec_row  = 1;
++    state.macrophone_spec_rows = n_draft;
++    state.macrophone_spec_batches++;
++
++    return true;
++}
++
+ int whisper_full_with_state(
+         struct whisper_context * ctx,
+           struct whisper_state * state,
+@@ -7336,6 +7860,8 @@ int whisper_full_with_state(
+ 
+                 whisper_kv_cache_clear(state->kv_self);
+ 
++                state->macrophone_spec_rows = 0; // [macrophone] rows from an earlier window/temperature are stale
++
+                 whisper_batch_prep_legacy(state->batch, prompt.data(), prompt.size(), 0, 0);
+ 
+                 if (!whisper_decode_internal(*ctx, *state, state->batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
+@@ -7629,6 +8155,15 @@ int whisper_full_with_state(
+ 
+                     const int n_past = prompt.size() + i;
+ 
++                    // [macrophone] speculative greedy decoding (single decoder, temperature 0)
++                    bool macrophone_skip_decode = false;
++                    const bool macrophone_spec =
++                        n_decoders_cur == 1 && t_cur < 1e-6f &&
++                        params.strategy == whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY &&
++                        !state->decoders[0].failed && !state->decoders[0].completed &&
++                        whisper_macrophone_spec_prepare(*state, state->decoders[0], n_past, macrophone_skip_decode);
++
++                    if (!macrophone_spec) {
+                     for (int j = 0; j < n_decoders_cur; ++j) {
+                         auto & decoder = state->decoders[j];
+ 
+@@ -7647,10 +8182,11 @@ int whisper_full_with_state(
+                         batch.logits  [batch.n_tokens]    = 1;
+                         batch.n_tokens++;
+                     }
++                    }
+ 
+-                    assert(batch.n_tokens > 0);
++                    assert(batch.n_tokens > 0 || macrophone_skip_decode);
+ 
+-                    if (!whisper_decode_internal(*ctx, *state, state->batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
++                    if (!macrophone_skip_decode && !whisper_decode_internal(*ctx, *state, state->batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
+                         WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
+                         return -9;
+                     }

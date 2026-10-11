@@ -1,0 +1,51 @@
+.DS_Store
+.build/
+.swiftpm/
+/build/
+/dist/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env*
+
+# whisper.cpp is fetched at a pinned commit and patched by scripts/build-whisper.sh
+/vendor/
+
+# Audio and model weights never belong in the repo
+*.wav
+*.m4a
+*.caf
+*.flac
+*.aiff
+*.mp3
+*.bin
+*.gguf
+*.safetensors
+*.mlmodelc/
+*.mlpackage/
+
+# Benchmark inputs are generated locally (bench/make-audio.sh, bench/fetch-data.sh)
+bench/audio/*.wav
+bench/data/
+bench/results/*.partial
+bench/results/*.tmp
+bench/results/run-all.log
+bench/gemm/gemm_bench
+bench/gemm/layer_bench
+bench/gemm/gemv_bench
+bench/gemm/chain_bench
+
+# Competitor harnesses: keep the sources, not their downloads, builds and environments
+bench/competitors/**/.venv/
+bench/competitors/**/venv-*/
+bench/competitors/**/.build/
+bench/competitors/**/hf/
+bench/competitors/**/hf_home/
+bench/competitors/**/models/
+bench/competitors/**/logs/
+bench/competitors/**/smoke/
+bench/competitors/whispercpp/bin/
+bench/competitors/whispercpp/build-*/
+bench/competitors/whispercpp/src/
+bench/competitors/whispercpp/setup.log

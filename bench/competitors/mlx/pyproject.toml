@@ -1,0 +1,16 @@
+[project]
+name = "macrophone-bench-mlx-whisper"
+version = "0.0.0"
+description = "MLX Whisper (large-v3-turbo) benchmark harness for the macrophone engine comparison"
+requires-python = ">=3.12"
+dependencies = [
+    # >= 0.30.0 is required for the M5 GPU Neural Accelerator matmul path (macOS >= 26.2).
+    "mlx>=0.30.0",
+    "mlx-whisper==0.4.3",
+    "soundfile>=0.13",
+]
+
+[tool.uv]
+package = false
+# Supply-chain cool-off: ignore anything uploaded in the week before setup (2026-10-10).
+exclude-newer = "2026-10-03T00:00:00Z"

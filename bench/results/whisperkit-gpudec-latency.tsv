@@ -1,0 +1,20 @@
+short	1	382.51	Run the tests again.
+short	2	382.14	Run the tests again.
+short	3	388.58	Run the tests again.
+short	4	387.86	Run the tests again.
+short	5	382.41	Run the tests again.
+medium	1	500.14	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	2	488.71	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	3	494.67	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	4	490.77	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	5	512.09	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+long	1	753.09	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	2	749.99	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	3	763.29	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	4	753.20	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	5	749.43	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+xlong	1	1002.41	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer, then a worker thread pulls samples, re-samples them to 16 kHz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	2	1007.53	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer, then a worker thread pulls samples, re-samples them to 16 kHz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	3	1035.46	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer, then a worker thread pulls samples, re-samples them to 16 kHz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	4	1005.14	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer, then a worker thread pulls samples, re-samples them to 16 kHz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	5	1010.13	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer, then a worker thread pulls samples, re-samples them to 16 kHz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.

@@ -1,0 +1,20 @@
+short	1	302.13	Run the tests again.
+short	2	302.67	Run the tests again.
+short	3	305.76	Run the tests again.
+short	4	304.36	Run the tests again.
+short	5	304.97	Run the tests again.
+medium	1	326.53	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	2	326.21	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	3	326.46	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	4	326.55	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+medium	5	327.11	Can you refactor the use effect hook in app.tsx so it uses a reducer instead?
+long	1	380.52	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	2	379.59	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	3	383.61	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	4	382.59	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+long	5	375.79	Okay, so the bug is in the parser. When the input has a trailing comma, the tokenizer emits an empty token, and then the AST builder crashes. Add a test case for that, fix it, and then run PyTest with a verbose flag.
+xlong	1	425.04	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer. Then a worker thread pulls samples, resamples them to 16 kilohertz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	2	425.40	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer. Then a worker thread pulls samples, resamples them to 16 kilohertz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	3	425.24	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer. Then a worker thread pulls samples, resamples them to 16 kilohertz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	4	425.03	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer. Then a worker thread pulls samples, resamples them to 16 kilohertz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.
+xlong	5	424.77	Let's step back and think about the architecture. I want the audio capture to run on a real-time thread that writes into a lock-free ring buffer. Then a worker thread pulls samples, resamples them to 16 kilohertz, runs voice activity detection, and hands finish segments to the whisper engine. Keep the model loaded and warm the GPU when the hotkey goes down. And measure every stage with signposts so we can see where the latency goes.

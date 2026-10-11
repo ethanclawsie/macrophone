@@ -1,0 +1,6 @@
+.venv/
+hf/
+models/
+smoke/
+__pycache__/
+logs/
