@@ -5,7 +5,7 @@ import ServiceManagement
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     enum State: Equatable {
-        case loading, ready, recording, transcribing
+        case downloading, loading, ready, recording, transcribing
         case error(String)
     }
 
@@ -41,6 +41,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state = .loading
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                try Self.ensureDefaultModelsExist(
+                    modelPath: config.modelPath,
+                    vadModelPath: config.vadModelPath,
+                    onDownloading: { DispatchQueue.main.async { self.state = .downloading } }
+                )
+                DispatchQueue.main.async {
+                    if self.state == .downloading { self.state = .loading }
+                }
                 let engine = try WhisperEngine(modelPath: config.modelPath, threads: Int32(config.threads),
                                                language: config.language)
                 engine.warmup()
@@ -52,11 +60,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DispatchQueue.main.async {
                     self.controller = controller
                     if Permissions.microphone { controller.prepareMicrophone(preferBuiltIn: config.preferBuiltInMic) }
-                    if self.state == .loading { self.state = .ready }
+                    if self.state == .loading || self.state == .downloading { self.state = .ready }
                 }
             } catch {
                 DispatchQueue.main.async { self.state = .error("\(error)") }
             }
+        }
+    }
+
+    private nonisolated static func ensureDefaultModelsExist(
+        modelPath: String,
+        vadModelPath: String,
+        onDownloading: @Sendable () -> Void
+    ) throws {
+        let fm = FileManager.default
+        let assets: [(path: String, url: String, expectedBytes: Int64)] = [
+            (
+                Paths.defaultVADModel.path,
+                "https://github.com/ethanclawsie/macrophone/releases/download/models-v1/ggml-silero-v6.2.0.bin",
+                885_098
+            ),
+            (
+                Paths.defaultModel.path,
+                "https://github.com/ethanclawsie/macrophone/releases/download/models-v1/ggml-large-v3-turbo-q4_0.bin",
+                473_992_235
+            ),
+        ]
+
+        var notified = false
+        for asset in assets {
+            guard (asset.path == modelPath || asset.path == vadModelPath),
+                  !fm.fileExists(atPath: asset.path) else { continue }
+            if !notified {
+                notified = true
+                onDownloading()
+            }
+            let dest = URL(fileURLWithPath: asset.path)
+            try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var downloadResult: Result<URL, Error>?
+            let task = URLSession.shared.downloadTask(with: URL(string: asset.url)!) { tmpURL, _, error in
+                if let error {
+                    downloadResult = .failure(error)
+                } else if let tmpURL {
+                    do {
+                        let partURL = dest.appendingPathExtension("part")
+                        try? fm.removeItem(at: partURL)
+                        try fm.moveItem(at: tmpURL, to: partURL)
+                        downloadResult = .success(partURL)
+                    } catch {
+                        downloadResult = .failure(error)
+                    }
+                } else {
+                    downloadResult = .failure(MacrophoneError.modelLoad(asset.path))
+                }
+                sem.signal()
+            }
+            task.resume()
+            sem.wait()
+
+            let partURL = try downloadResult!.get()
+            let attrs = try fm.attributesOfItem(atPath: partURL.path)
+            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            guard size == asset.expectedBytes else {
+                try? fm.removeItem(at: partURL)
+                throw MacrophoneError.modelLoad(asset.path)
+            }
+            try? fm.removeItem(at: dest)
+            try fm.moveItem(at: partURL, to: dest)
         }
     }
 
@@ -152,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem?.button else { return }
         let symbol: String
         switch state {
+        case .downloading: symbol = "arrow.down.circle"
         case .loading: symbol = "hourglass"
         case .ready: symbol = "waveform"
         case .recording: symbol = "mic.fill"
@@ -166,6 +239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         switch state {
+        case .downloading:
+            menu.addItem(withTitle: "Downloading model (first launch)…", action: nil, keyEquivalent: "")
+            menu.addItem(.separator())
         case .loading:
             menu.addItem(withTitle: "Loading model…", action: nil, keyEquivalent: "")
             menu.addItem(.separator())
@@ -185,6 +261,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
+        let currentKey = HotkeyMonitor.Key(rawValue: config.hotkey) ?? .rightOption
+        let hotkeyMenu = NSMenu()
+        for key in HotkeyMonitor.Key.allCases {
+            let keyItem = item(key.label, #selector(selectHotkey(_:)))
+            keyItem.representedObject = key.rawValue
+            keyItem.state = (key == currentKey) ? .on : .off
+            hotkeyMenu.addItem(keyItem)
+        }
+        let hotkeyRoot = NSMenuItem(title: "Hotkey (\(currentKey.label))", action: nil, keyEquivalent: "")
+        hotkeyRoot.submenu = hotkeyMenu
+        menu.addItem(hotkeyRoot)
+
         menu.addItem(item("Open Config File", #selector(openConfig)))
         menu.addItem(item("Reload Config", #selector(reloadConfig)))
         menu.addItem(item("Open Latency Log", #selector(openLog)))
@@ -199,6 +287,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
         return item
+    }
+
+    @objc private func selectHotkey(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        config.hotkey = raw
+        try? config.save()
+        if hotkey?.key.rawValue != config.hotkey { startHotkey() }
     }
 
     @objc private func grantMicrophone() { Permissions.openSettings("Privacy_Microphone") }

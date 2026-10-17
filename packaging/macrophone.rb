@@ -8,7 +8,7 @@ cask "macrophone" do
   homepage "https://github.com/ethanclawsie/macrophone"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Macrophone.app"
 
