@@ -1,5 +1,6 @@
 import AppKit
 import MacrophoneCore
+import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -201,6 +202,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Open Config File", #selector(openConfig)))
         menu.addItem(item("Reload Config", #selector(reloadConfig)))
         menu.addItem(item("Open Latency Log", #selector(openLog)))
+        let loginItem = item("Launch at Login", #selector(toggleLaunchAtLogin))
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(loginItem)
         menu.addItem(.separator())
         menu.addItem(item("Quit Macrophone", #selector(quit), key: "q"))
     }
@@ -233,6 +237,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func reloadConfig() { applyConfig() }
     @objc private func openLog() { NSWorkspace.shared.open(LatencyLog.url) }
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+                if SMAppService.mainApp.status == .requiresApproval {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+            }
+        } catch {
+            NSLog("[Macrophone] Failed to update launch at login: %@", error.localizedDescription)
+        }
+    }
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
