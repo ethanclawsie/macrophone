@@ -15,8 +15,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotkey: HotkeyMonitor?
     private var holding = false
     private var pressedAt: UInt64 = 0
-    private var lastText = ""
-    private var lastReport = ""
     private var permissionTimer: Timer?
 
     private var state: State = .loading {
@@ -142,17 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !text.isEmpty {
             TextInserter.shared.insert(text, submit: submit, restoreClipboard: config.restoreClipboard,
                                        fallbackDelay: Double(config.restoreClipboardDelayMs) / 1000)
-            lastText = text
         }
         let total = Double(Clock.now &- releasedAt) / 1e6
         if state == .transcribing { state = .ready }
-
-        let s = result.stats
-        let mic = outcome.micStartMs.map { String(format: "%.0f", $0) } ?? "?"
-        let how = s.answeredFromSpeculation ? "speculation"
-            : s.finalPassMs.map { String(format: "final pass %.0f ms on %.1f s", $0, s.finalPassSeconds ?? 0) } ?? "no speech"
-        lastReport = String(format: "release→paste %.0f ms (%@) · mic start %@ ms · %.1f s audio · %d passes",
-                            total, how, mic, s.audioSeconds, s.passes)
         LatencyLog.append(totalMs: total, outcome: outcome, chars: text.count)
     }
 
@@ -175,18 +165,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let key = HotkeyMonitor.Key(rawValue: config.hotkey) ?? .rightOption
-        let status: String
         switch state {
-        case .loading: status = "Loading model…"
-        case .ready, .recording, .transcribing: status = "Hold \(key.label) to talk · ⇧ on release to submit"
-        case .error(let message): status = "Error: \(message)"
-        }
-        menu.addItem(withTitle: status, action: nil, keyEquivalent: "")
-        if !lastReport.isEmpty { menu.addItem(withTitle: lastReport, action: nil, keyEquivalent: "") }
-        if !lastText.isEmpty {
-            let preview = lastText.count > 60 ? String(lastText.prefix(60)) + "…" : lastText
-            menu.addItem(item("Copy “\(preview.trimmingCharacters(in: .whitespaces))”", #selector(copyLast)))
+        case .loading:
+            menu.addItem(withTitle: "Loading model…", action: nil, keyEquivalent: "")
+            menu.addItem(.separator())
+        case .error(let message):
+            menu.addItem(withTitle: "Error: \(message)", action: nil, keyEquivalent: "")
+            menu.addItem(.separator())
+        case .ready, .recording, .transcribing:
+            break
         }
 
         var missing: [NSMenuItem] = []
@@ -194,11 +181,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !Permissions.inputMonitoring { missing.append(item("Grant Input Monitoring…", #selector(grantInputMonitoring))) }
         if !Permissions.accessibility { missing.append(item("Grant Accessibility (to paste)…", #selector(grantAccessibility))) }
         if !missing.isEmpty {
-            menu.addItem(.separator())
             missing.forEach(menu.addItem)
+            menu.addItem(.separator())
         }
 
-        menu.addItem(.separator())
         menu.addItem(item("Open Config File", #selector(openConfig)))
         menu.addItem(item("Reload Config", #selector(reloadConfig)))
         menu.addItem(item("Open Latency Log", #selector(openLog)))
@@ -213,11 +199,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = self
         return item
-    }
-
-    @objc private func copyLast() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(lastText, forType: .string)
     }
 
     @objc private func grantMicrophone() { Permissions.openSettings("Privacy_Microphone") }
